@@ -1,0 +1,64 @@
+# ---- build artifacts ----------------------------------------------------
+/wispr-media-pause
+*.o
+*.dSYM/
+.build/
+
+# ---- macOS noise --------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# ---- editors / agents ---------------------------------------------------
+.vscode/
+.idea/
+.cursor/
+.claude/
+*.swp
+*~
+
+# ---- scratch & working files (never publishable) ------------------------
+$-*.md
+*.tmp
+*.bak
+*.orig
+scratch/
+tmp/
+
+# ---- logs & local state -------------------------------------------------
+*.log
+logs/
+
+# ---- secrets & env — belt and braces, this project needs none -----------
+.env
+.env.*
+*.pem
+*.key
+credentials*
+secrets*
+
+# ---- raw material that must never reach a public repo -------------------
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.sqlite
+*.sqlite3
+*.db
+*.csv
+*.xlsx
+exports/
+dumps/
+recordings/
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.mov
+
+# ---- social/marketing drafts (local only, never publish) ----------------
+social-*.txt
