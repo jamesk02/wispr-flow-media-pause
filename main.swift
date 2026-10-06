@@ -6,8 +6,12 @@
 // call silently fails and music plays straight through dictation. This
 // pauses instead of muting, so it works on any output device.
 //
-// Trigger: tails Wispr's own log for the two markers it emits around a
-// dictation, rather than guessing from keystrokes. Media control: AppleScript
+// Trigger (default, `--trigger mic`): watches every CoreAudio device that has
+// input streams and treats "some input device started running" as dictation
+// start and "all input devices stopped" as dictation stop. Newer Wispr Flow
+// builds (seen on 1.6.1034) no longer write the log markers the original
+// trigger relied on. The old log-tailing trigger is still available with
+// `--trigger log` (and `--log <path>`). Media control: AppleScript
 // sent to specific players (Spotify, Music) via an /usr/bin/osascript
 // subprocess, sending explicit pause/play (never a toggle — a toggle would
 // start music that wasn't playing).
@@ -28,6 +32,9 @@ import CoreAudio
 // MARK: - CLI flags
 
 var logPath = NSHomeDirectory() + "/Library/Logs/Wispr Flow/main.log"
+// "mic" (default): microphone activity. "log": tail Wispr's main.log for
+// its start/stop markers (only works on Wispr builds that still write them).
+var triggerMode = "mic"
 var resumeDelayMs = 700
 var failsafeMin = 15
 var probeMode = false
@@ -41,6 +48,14 @@ do {
     while let a = it.next() {
         switch a {
         case "--log": if let v = it.next() { logPath = v }
+        case "--trigger":
+            if let v = it.next() {
+                guard v == "mic" || v == "log" else {
+                    print("unknown --trigger '\(v)' (expected mic or log)")
+                    exit(2)
+                }
+                triggerMode = v
+            }
         case "--resume-delay-ms": if let v = it.next(), let n = Int(v) { resumeDelayMs = n }
         case "--failsafe-min": if let v = it.next(), let n = Int(v) { failsafeMin = n }
         case "--probe": probeMode = true
@@ -93,6 +108,79 @@ func defaultOutputDeviceName() -> String? {
         AudioObjectGetPropertyData(dev, &nameAddr, 0, nil, &nameSize, $0)
     }
     return st == noErr ? (cf as String?) : nil
+}
+
+// MARK: - input devices (mic trigger)
+
+func audioObjectIDs(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
+                    scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> [AudioObjectID] {
+    var addr = AudioObjectPropertyAddress(mSelector: selector, mScope: scope,
+                                          mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(obj, &addr, 0, nil, &size) == noErr, size > 0 else { return [] }
+    var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &ids) == noErr else { return [] }
+    return Array(ids.prefix(Int(size) / MemoryLayout<AudioObjectID>.size))
+}
+
+func audioUInt32(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector) -> UInt32? {
+    var addr = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    var v: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    return AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &v) == noErr ? v : nil
+}
+
+func audioObjectName(_ obj: AudioObjectID) -> String {
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName, mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    var cf: CFString? = nil
+    var size = UInt32(MemoryLayout<CFString?>.size)
+    let st = withUnsafeMutablePointer(to: &cf) {
+        AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, $0)
+    }
+    return st == noErr ? ((cf as String?) ?? "device \(obj)") : "device \(obj)"
+}
+
+struct InputDevice {
+    let id: AudioObjectID
+    let name: String
+    let hasOutput: Bool
+    let runningSomewhere: Bool
+}
+
+// Re-enumerated on every call (cheap — a handful of devices), so devices
+// that appear/disappear (Bluetooth headsets connecting, USB mics plugged
+// in) are picked up without any listener bookkeeping.
+func inputDevices() -> [InputDevice] {
+    audioObjectIDs(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDevices).compactMap { dev in
+        guard !audioObjectIDs(dev, kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeInput).isEmpty else { return nil }
+        let hasOutput = !audioObjectIDs(dev, kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeOutput).isEmpty
+        let running = (audioUInt32(dev, kAudioDevicePropertyDeviceIsRunningSomewhere) ?? 0) != 0
+        return InputDevice(id: dev, name: audioObjectName(dev), hasOutput: hasOutput, runningSomewhere: running)
+    }
+}
+
+// kAudioDevicePropertyDeviceIsRunningSomewhere is device-wide: on a device
+// with BOTH input and output streams (USB interfaces like the MiniFuse,
+// virtual devices) it is also true when something merely PLAYS through it
+// — which would make music itself look like dictation and loop
+// pause/resume. For such devices we additionally require that some process
+// is actually capturing input (per-process HAL objects, macOS 14.2+). nil =
+// that API is unavailable, in which case combined devices are ignored.
+func anyProcessRunningInput() -> Bool? {
+    let procs = audioObjectIDs(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList)
+    guard !procs.isEmpty else { return nil }
+    return procs.contains { (audioUInt32($0, kAudioProcessPropertyIsRunningInput) ?? 0) != 0 }
+}
+
+// Names of input devices currently in use for capture (empty = mic off).
+func activeInputDeviceNames() -> [String] {
+    let devs = inputDevices().filter { $0.runningSomewhere }
+    guard !devs.isEmpty else { return [] }
+    // Only pay for the process scan when a combined in+out device is running.
+    let processInput = devs.contains { $0.hasOutput } ? (anyProcessRunningInput() ?? false) : false
+    return devs.filter { !$0.hasOutput || processInput }.map { $0.name }
 }
 
 // MARK: - AppleScript media control
@@ -330,6 +418,14 @@ if probeMode {
     } else {
         print("default output: (unknown)")
     }
+    let active = Set(activeInputDeviceNames())
+    let devs = inputDevices()
+    if devs.isEmpty { print("input devices: (none found)") }
+    for d in devs {
+        let use = active.contains(d.name) ? "IN USE" : "idle"
+        let note = d.hasOutput ? " (also has output; device running=\(d.runningSomewhere))" : ""
+        print("input: \(d.name): \(use)\(note)")
+    }
     exit(0)
 }
 
@@ -346,39 +442,114 @@ func processLine(_ line: String) {
     }
 }
 
-let pipe = Pipe()
+let logPipe = Pipe()
 var lineBuffer = Data()
 let newline = Data([0x0A])
 
-pipe.fileHandleForReading.readabilityHandler = { handle in
-    let data = handle.availableData
-    guard !data.isEmpty else { return }
-    lineBuffer.append(data)
-    while let r = lineBuffer.range(of: newline) {
-        let lineData = lineBuffer.subdata(in: lineBuffer.startIndex..<r.lowerBound)
-        lineBuffer.removeSubrange(lineBuffer.startIndex..<r.upperBound)
-        if let line = String(data: lineData, encoding: .utf8) {
-            processLine(line)
+func startLogTrigger() {
+    logPipe.fileHandleForReading.readabilityHandler = { handle in
+        let data = handle.availableData
+        guard !data.isEmpty else { return }
+        lineBuffer.append(data)
+        while let r = lineBuffer.range(of: newline) {
+            let lineData = lineBuffer.subdata(in: lineBuffer.startIndex..<r.lowerBound)
+            lineBuffer.removeSubrange(lineBuffer.startIndex..<r.upperBound)
+            if let line = String(data: lineData, encoding: .utf8) {
+                processLine(line)
+            }
         }
+    }
+
+    let tail = Process()
+    tail.executableURL = URL(fileURLWithPath: "/usr/bin/tail")
+    tail.arguments = ["-F", "-n", "0", logPath]
+    tail.standardOutput = logPipe
+    tail.standardError = FileHandle.nullDevice
+    tail.terminationHandler = { proc in
+        log("tail exited (status \(proc.terminationStatus)) — exiting for launchd restart")
+        exit(1)
+    }
+
+    do {
+        try tail.run()
+    } catch {
+        fail("failed to launch /usr/bin/tail: \(error)")
+    }
+    log("wispr-media-pause started — tailing \"\(logPath)\", resume-delay=\(resumeDelayMs)ms, failsafe=\(failsafeMin)min")
+}
+
+// MARK: - mic trigger
+
+// Simple poll rather than AudioObject property listeners: one cheap HAL
+// read per input device every 250ms, devices re-enumerated each tick, no
+// listener lifetime/re-registration edge cases. Debounced: the mic must be
+// on for >= micOnDebounceMs before it counts as "started" (ignores brief
+// device probes), and off for >= micOffDebounceMs before "stopped" (ignores
+// a recorder briefly restarting mid-dictation).
+let micPollMs = 250
+let micOnDebounceMs = 250
+let micOffDebounceMs = 500
+let micQueue = DispatchQueue(label: "wispr-media-pause.mic")
+var micActive = false          // debounced state, micQueue only
+var micRawSince = Date()       // when the raw reading last changed
+var micRawLast = false
+
+func micTick() {
+    let names = activeInputDeviceNames()
+    let raw = !names.isEmpty
+    let now = Date()
+    if raw != micRawLast {
+        micRawLast = raw
+        micRawSince = now
+    }
+    let heldMs = Int(now.timeIntervalSince(micRawSince) * 1000)
+    if raw && !micActive && heldMs >= micOnDebounceMs {
+        micActive = true
+        log("mic on: \(names.joined(separator: ", "))")
+        handleStartMarker()
+    } else if !raw && micActive && heldMs >= micOffDebounceMs {
+        micActive = false
+        log("mic off")
+        handleStopMarker()
     }
 }
 
-let tail = Process()
-tail.executableURL = URL(fileURLWithPath: "/usr/bin/tail")
-tail.arguments = ["-F", "-n", "0", logPath]
-tail.standardOutput = pipe
-tail.standardError = FileHandle.nullDevice
-tail.terminationHandler = { proc in
-    log("tail exited (status \(proc.terminationStatus)) — exiting for launchd restart")
-    exit(1)
-}
+func startMicTrigger() {
+    // Let the HAL deliver its internal notifications on its own thread —
+    // this process has no CFRunLoop running (dispatchMain), and without this
+    // the HAL can serve stale property values.
+    var rl: CFRunLoop? = nil
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyRunLoop,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    _ = withUnsafePointer(to: &rl) {
+        AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil,
+                                   UInt32(MemoryLayout<CFRunLoop?>.size), $0)
+    }
 
-do {
-    try tail.run()
-} catch {
-    fail("failed to launch /usr/bin/tail: \(error)")
+    // Seed with the current state so a mic already in use at launch (e.g.
+    // a call in progress) is not treated as a fresh dictation start.
+    micQueue.sync {
+        let names = activeInputDeviceNames()
+        micActive = !names.isEmpty
+        micRawLast = micActive
+        micRawSince = Date()
+    }
+    let timer = DispatchSource.makeTimerSource(queue: micQueue)
+    timer.schedule(deadline: .now() + .milliseconds(micPollMs), repeating: .milliseconds(micPollMs),
+                   leeway: .milliseconds(50))
+    timer.setEventHandler { micTick() }
+    timer.resume()
+    micTimer = timer
+    let devs = inputDevices().map { $0.name }
+    log("wispr-media-pause started — trigger=mic (inputs: \(devs.joined(separator: ", "))), mic currently \(micActive ? "on" : "off"), resume-delay=\(resumeDelayMs)ms, failsafe=\(failsafeMin)min")
 }
+var micTimer: DispatchSourceTimer?
 
-log("wispr-media-pause started — tailing \"\(logPath)\", resume-delay=\(resumeDelayMs)ms, failsafe=\(failsafeMin)min")
+if triggerMode == "log" {
+    startLogTrigger()
+} else {
+    startMicTrigger()
+}
 
 dispatchMain()

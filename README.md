@@ -29,11 +29,20 @@ than muting anyway, since you don't lose a chunk of the track.
 
 ## How it works
 
-- Tails Wispr Flow's own log (`~/Library/Logs/Wispr Flow/main.log`) for the
-  two lines Wispr emits around every dictation — reacting to what Wispr
-  actually did, rather than guessing from hotkeys:
-  - start: `Acquired recording mutex for startRecording`
-  - stop: `audioRecorder: Stopping audio capture`
+- **Trigger (default): microphone activity.** Every 250 ms it checks every
+  audio input device (not just the default one — e.g. the built-in mic while
+  Bluetooth headphones are the output) via CoreAudio's
+  `kAudioDevicePropertyDeviceIsRunningSomewhere`. Mic goes on (held for
+  250 ms) = dictation started; all mics off (for 500 ms) = dictation stopped.
+  Devices are re-enumerated every check, so headsets/USB mics that connect
+  later are covered. Devices with both input and output (USB interfaces,
+  virtual devices) only count when some process is actually capturing
+  input, so music playing through them can't look like dictation.
+- Newer Wispr Flow builds (seen on 1.6.1034) no longer write the log lines
+  the original version tailed. The old log trigger is still available with
+  `--trigger log` (start: `Acquired recording mutex for startRecording`,
+  stop: `audioRecorder: Stopping audio capture` in
+  `~/Library/Logs/Wispr Flow/main.log`).
 - On start: checks Spotify and Apple Music via AppleScript (each check
   guarded with `if application "X" is running`, so it can never launch a
   player), pauses whichever are playing, and remembers exactly which.
@@ -45,11 +54,10 @@ than muting anyway, since you don't lose a chunk of the track.
   blip. A generation counter discards stale in-flight queries, and a
   15-minute failsafe force-resumes if a stop is ever missed, so audio can't
   stay paused forever.
-- Survives Wispr's log rotation (`tail -F`).
 - On headphones (AirPods, etc.) music can't bleed into the dictation mic, so
   pausing is pointless — `--skip-output` skips it when the **current default
   output device's name** matches a comma-separated substring list, checked
-  fresh on every start marker (stop still resumes normally, in case you
+  fresh on every start (stop still resumes normally, in case you
   switched output mid-dictation). Install with it via
   `./install.sh --skip-output AirPods`, and run `--probe` first to see the
   exact device name to copy.
@@ -96,19 +104,21 @@ Play some music, dictate with Wispr, and watch the log:
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--log <path>` | `~/Library/Logs/Wispr Flow/main.log` | log file to tail (point at a scratch file to test) |
+| `--trigger <mic\|log>` | `mic` | `mic`: any input device in use; `log`: tail Wispr's log for its markers (older Wispr builds only) |
+| `--log <path>` | `~/Library/Logs/Wispr Flow/main.log` | log file to tail with `--trigger log` |
 | `--resume-delay-ms <n>` | `700` | delay before resuming after a stop |
 | `--failsafe-min <n>` | `15` | force-resume after this long if still paused; `0` disables |
-| `--probe` | — | print each player's running/playing state and exit |
+| `--probe` | — | print each player's state, the default output, and each input device and whether it's in use, then exit |
 | `--skip-output <list>` | — | skip pausing when the default output device name matches any comma-separated substring, e.g. `"AirPods"` — for headphones, where music can't bleed into the mic |
 
 ## Limitations & risks (honest ones)
 
-- **Depends on two exact strings in Wispr Flow's log** (verified against
-  Wispr Flow 1.6.531). If a Wispr update rewords them, this breaks
-  *silently* — music just plays through dictation again. To check: dictate
-  once, then grep Wispr's `main.log` for the two marker strings above; if
-  they're gone, update the constants at the top of `main.swift`.
+- **Any app using the mic pauses music**, not just Wispr: Zoom/Meet calls,
+  voice notes, Siri, a browser tab with mic access. Music resumes when the
+  mic is released (only what this tool paused). A mic already in use when
+  the agent starts is not treated as a new start.
+- With `--trigger log`: depends on two exact strings in Wispr Flow's log
+  (verified against Wispr Flow 1.6.531; gone in 1.6.1034).
 - **Spotify and Apple Music only.** Browser audio (YouTube etc.) is out of
   reach — AppleScript only controls named apps.
 - **Why not the system now-playing layer (MediaRemote)?** It would be
@@ -117,7 +127,8 @@ Play some music, dictate with Wispr, and watch the log:
   are accepted but silently dropped. Verified live before switching to
   AppleScript. (Beware when testing that path yourself: with nothing
   playing, a dropped command is indistinguishable from a working one.)
-- Tested on macOS 26.5.2 with Wispr Flow 1.6.531.
+- Log trigger tested on macOS 26.5.2 with Wispr Flow 1.6.531; mic trigger
+  built on macOS 15.5 with Wispr Flow 1.6.1034.
 
 ## Uninstall
 
